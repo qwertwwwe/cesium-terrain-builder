@@ -7,6 +7,10 @@ set(TOOL_TARGETS commander ctb  ${CMAKE_THREAD_LIBS_INIT})
 add_executable(ctb-tile ctb-tile.cpp)
 target_link_libraries(ctb-tile ${TOOL_TARGETS})
 
+# Add the `ctb-single-tile` executable
+add_executable(ctb-single-tile ctb-single-tile.cpp)
+target_link_libraries(ctb-single-tile ${TOOL_TARGETS})
+
 # Add the `ctb-export` executable
 add_executable(ctb-export ctb-export.cpp)
 target_link_libraries(ctb-export ${TOOL_TARGETS})
