@@ -54,6 +54,9 @@
 #include "GDALDatasetReader.hpp"
 #include "CTBFileTileSerializer.hpp"
 
+#include "CTBZOutputStream.hpp"
+
+
 using namespace std;
 using namespace ctb;
 
@@ -69,6 +72,7 @@ public:
   TerrainBuild(const char *name, const char *version) :
     Command(name, version),
     outputDir("."),
+    outputFileName("output.terrrain"),
     outputFormat("Terrain"),
     profile("geodetic"),
     threadCount(-1),
@@ -103,8 +107,8 @@ public:
   }
 
   static void
-  setOutputDir(command_t *command) {
-    static_cast<TerrainBuild *>(Command::self(command))->outputDir = command->arg;
+  setOutputFileName(command_t *command) {
+    static_cast<TerrainBuild *>(Command::self(command))->outputFileName = command->arg;
   }
 
   static void
@@ -243,9 +247,10 @@ public:
     static_cast<TerrainBuild *>(Command::self(command))->tileY = atoi(command->arg);
   }
 
-  const char *outputDir,
+  const char *outputFileName,
     *outputFormat,
-    *profile;
+    *profile,
+    *outputDir;
 
   int threadCount,
     tileSize,
@@ -656,7 +661,7 @@ buildTerrain(TerrainSerializer &serializer, const TerrainTiler &tiler, TerrainBu
 
 /// Output mesh tiles represented by a tiler to a directory
 static void
-buildMesh(MeshSerializer &serializer, const MeshTiler &tiler, TerrainBuild *command, TerrainMetadata *metadata, bool writeVertexNormals = false) {
+buildMesh(const string outputFileName, const MeshTiler &tiler, TerrainBuild *command, bool writeVertexNormals = false) {
   // DEBUG Chunker:
   #if 0
   const string dirname = string(command->outputDir) + osDirSep;
@@ -686,12 +691,18 @@ buildMesh(MeshSerializer &serializer, const MeshTiler &tiler, TerrainBuild *comm
   const TileCoordinate coordinate = TileCoordinate(tileZ, tileX, tileY);
   GDALDatasetReaderWithOverviews reader(tiler);
 
-  // if (metadata) metadata->add(tiler.grid(), coordinate);
-  if (serializer.mustSerializeCoordinate(&coordinate)) {
-    MeshTile *tile = tiler.createMesh(tiler.dataset(), coordinate, &reader);
-    serializer.serializeTile(tile, writeVertexNormals);
-    delete tile;
+  MeshTile *tile = tiler.createMesh(tiler.dataset(), coordinate, &reader);
+
+  const string tempFilename = concat(outputFileName, ".tmp");
+  CTBZFileOutputStream ostream(tempFilename.c_str());
+  tile->writeFile(ostream, writeVertexNormals);
+  ostream.close();
+
+  if (VSIRename(tempFilename.c_str(), outputFileName.c_str()) != 0) {
+    throw new CTBException("Could not rename temporary file");
   }
+
+  delete tile;
 }
 
 static void
@@ -728,44 +739,35 @@ runTiler(const char *inputFilename, TerrainBuild *command, Grid *grid, TerrainMe
     return 1;
   }
 
-  // Metadata of only this thread, it will be joined to global later
-  TerrainMetadata *threadMetadata = metadata ? new TerrainMetadata() : NULL;
-
-  // Choose serializer of tiles (Directory of files, MBTiles store...)
-  CTBFileTileSerializer serializer(string(command->outputDir) + osDirSep, command->resume);
+  const string outputFileName = string(command->outputFileName);
 
   try {
-    serializer.startSerialization();
+    // if (command->metadata) {
+    //   const RasterTiler tiler(poDataset, *grid, command->tilerOptions);
+    //   buildMetadata(tiler, command, threadMetadata);
+    // } else if (strcmp(command->outputFormat, "Terrain") == 0) {
+    //   const TerrainTiler tiler(poDataset, *grid);
+    //   buildTerrain(serializer, tiler, command, threadMetadata);
+    // } else if (strcmp(command->outputFormat, "Mesh") == 0) {
+    //   const MeshTiler tiler(poDataset, *grid, command->tilerOptions, command->meshQualityFactor);
+    //   buildMesh(outputFileName, tiler, command, threadMetadata, command->vertexNormals);
+    // } else {                    // it's a GDAL format
+    //   const RasterTiler tiler(poDataset, *grid, command->tilerOptions);
+    //   buildGDAL(serializer, tiler, command, threadMetadata);
+    // }
 
-    if (command->metadata) {
-      const RasterTiler tiler(poDataset, *grid, command->tilerOptions);
-      buildMetadata(tiler, command, threadMetadata);
-    } else if (strcmp(command->outputFormat, "Terrain") == 0) {
-      const TerrainTiler tiler(poDataset, *grid);
-      buildTerrain(serializer, tiler, command, threadMetadata);
-    } else if (strcmp(command->outputFormat, "Mesh") == 0) {
+    if (strcmp(command->outputFormat, "Mesh") == 0) {
       const MeshTiler tiler(poDataset, *grid, command->tilerOptions, command->meshQualityFactor);
-      buildMesh(serializer, tiler, command, threadMetadata, command->vertexNormals);
-    } else {                    // it's a GDAL format
-      const RasterTiler tiler(poDataset, *grid, command->tilerOptions);
-      buildGDAL(serializer, tiler, command, threadMetadata);
+      buildMesh(outputFileName, tiler, command, command->vertexNormals);
+    }else {
+      throw new CTBException("Current only support Mesh");
     }
-
   } catch (CTBException &e) {
     cerr << "Error: " << e.what() << endl;
   }
-  serializer.endSerialization();
 
   GDALClose(poDataset);
 
-  // Pass metadata to global instance.
-  if (threadMetadata) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-
-    metadata->add(*threadMetadata);
-    delete threadMetadata;
-  }
   return 0;
 }
 
@@ -774,20 +776,16 @@ main(int argc, char *argv[]) {
   // Specify the command line interface
   TerrainBuild command = TerrainBuild(argv[0], version.cstr);
   command.setUsage("[options] GDAL_DATASOURCE");
-  command.option("-o", "--output-dir <dir>", "specify the output directory for the tiles (defaults to working directory)", TerrainBuild::setOutputDir);
+  command.option("-o", "--output-file <filename>", "specify the output file path for the output file", TerrainBuild::setOutputFileName);
   command.option("-f", "--output-format <format>", "specify the output format for the tiles. This is either `Terrain` (the default), `Mesh` (Chunked LOD mesh), or any format listed by `gdalinfo --formats`", TerrainBuild::setOutputFormat);
   command.option("-p", "--profile <profile>", "specify the TMS profile for the tiles. This is either `geodetic` (the default) or `mercator`", TerrainBuild::setProfile);
-  command.option("-c", "--thread-count <count>", "specify the number of threads to use for tile generation. On multicore machines this defaults to the number of CPUs", TerrainBuild::setThreadCount);
   command.option("-t", "--tile-size <size>", "specify the size of the tiles in pixels. This defaults to 65 for terrain tiles and 256 for other GDAL formats", TerrainBuild::setTileSize);
-  command.option("-s", "--start-zoom <zoom>", "specify the zoom level to start at. This should be greater than the end zoom level", TerrainBuild::setStartZoom);
-  command.option("-e", "--end-zoom <zoom>", "specify the zoom level to end at. This should be less than the start zoom level and >= 0", TerrainBuild::setEndZoom);
   command.option("-r", "--resampling-method <algorithm>", "specify the raster resampling algorithm.  One of: nearest; bilinear; cubic; cubicspline; lanczos; average; mode; max; min; med; q1; q3. Defaults to average.", TerrainBuild::setResampleAlg);
   command.option("-n", "--creation-option <option>", "specify a GDAL creation option for the output dataset in the form NAME=VALUE. Can be specified multiple times. Not valid for Terrain tiles.", TerrainBuild::addCreationOption);
   command.option("-z", "--error-threshold <threshold>", "specify the error threshold in pixel units for transformation approximation. Larger values should mean faster transforms. Defaults to 0.125", TerrainBuild::setErrorThreshold);
   command.option("-m", "--warp-memory <bytes>", "The memory limit in bytes used for warp operations. Higher settings should be faster. Defaults to a conservative GDAL internal setting.", TerrainBuild::setWarpMemory);
   command.option("-R", "--resume", "Do not overwrite existing files", TerrainBuild::setResume);
   command.option("-g", "--mesh-qfactor <factor>", "specify the factor to multiply the estimated geometric error to convert heightmaps to irregular meshes. Larger values should mean minor quality. Defaults to 1.0", TerrainBuild::setMeshQualityFactor);
-  command.option("-l", "--layer", "only output the layer.json metadata file", TerrainBuild::setMetadata);
   command.option("-C", "--cesium-friendly", "Force the creation of missing root tiles to be CesiumJS-friendly", TerrainBuild::setCesiumFriendly);
   command.option("-N", "--vertex-normals", "Write 'Oct-Encoded Per-Vertex Normals' for Terrain Lighting, only for `Mesh` format", TerrainBuild::setVertexNormals);
   command.option("-q", "--quiet", "only output errors", TerrainBuild::setQuiet);
@@ -834,11 +832,13 @@ main(int argc, char *argv[]) {
 
 
   // Calculate metadata?
-  const string dirname = string(command.outputDir) + osDirSep;
-  const std::string filename = concat(dirname, "layer.json");
   TerrainMetadata *metadata = command.metadata ? new TerrainMetadata() : NULL;
 
   runTiler(command.getInputFilename(), &command, &grid, metadata);
+
+
+  // const std::string filename = concat(dirname, "layer.json");
+  // const string dirname = string(command.outputDir) + osDirSep;
 
   // // CesiumJS friendly?
   // if (command.cesiumFriendly && (strcmp(command.profile, "geodetic") == 0) && command.endZoom <= 0) {
